@@ -1,6 +1,5 @@
 "use client";
 
-import { useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 
 type Dropzone = {
@@ -327,11 +326,10 @@ function getLandingPatternGeometry(
 }
 
 export default function Home() {
-  const searchParams = useSearchParams();
-  const dropzoneIdParam = (searchParams.get("dropzone_id") ?? "").toLowerCase();
   const [dropzones, setDropzones] = useState<Dropzone[]>([]);
   const [dropzonesLoaded, setDropzonesLoaded] = useState(false);
   const [dropzonesError, setDropzonesError] = useState("");
+  const [dropzoneIdParam, setDropzoneIdParam] = useState("");
   const [winds, setWinds] = useState<WindPoint[]>([]);
   const [forecastTime, setForecastTime] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -383,6 +381,18 @@ export default function Home() {
     };
 
     void loadDropzones();
+  }, []);
+
+  useEffect(() => {
+    const readDropzoneId = () => {
+      const current = new URLSearchParams(window.location.search).get("dropzone_id") ?? "";
+      setDropzoneIdParam(current.toLowerCase());
+    };
+
+    readDropzoneId();
+    window.addEventListener("popstate", readDropzoneId);
+
+    return () => window.removeEventListener("popstate", readDropzoneId);
   }, []);
 
   const selectedDz = useMemo(() => {
