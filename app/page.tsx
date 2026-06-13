@@ -337,6 +337,14 @@ export default function Home() {
   const [refreshTick, setRefreshTick] = useState(0);
 
   useEffect(() => {
+    if (window.location.protocol === "https:" && window.location.hostname === "localhost") {
+      const correctedUrl = new URL(window.location.href);
+      correctedUrl.protocol = "http:";
+      window.location.replace(correctedUrl.toString());
+    }
+  }, []);
+
+  useEffect(() => {
     const loadDropzones = async () => {
       try {
         setDropzonesError("");
@@ -615,7 +623,7 @@ export default function Home() {
                   {dropzones.map((dz) => (
                     <a
                       key={dz.id}
-                      href={`?dropzone_id=${encodeURIComponent(dz.id)}`}
+                      href={`/?dropzone_id=${encodeURIComponent(dz.id)}`}
                       className="rounded border border-zinc-300 bg-zinc-50 px-3 py-1.5 text-sm font-medium text-zinc-800 hover:bg-zinc-100"
                     >
                       {dz.id}

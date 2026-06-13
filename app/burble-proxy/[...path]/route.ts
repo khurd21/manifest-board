@@ -6,6 +6,7 @@ export const dynamic = "force-dynamic";
 const UPSTREAM_ORIGIN = "https://dzm.burblesoft.com";
 const COOKIE_PREFIX = "burble_proxy__";
 const PROXY_PATH = "/burble-proxy";
+const ACTIVE_DZ_COOKIE = `${COOKIE_PREFIX}active_dz_id`;
 
 function buildUpstreamCookieHeader(request: NextRequest) {
     const cookiePairs = request.cookies
@@ -57,9 +58,13 @@ function splitSetCookieHeader(setCookieHeader: string) {
     return setCookieHeader.split(/, (?=[^;,]+=)/g);
 }
 
-function rewriteBody(body: string) {
+function rewriteBody(body: string, request: NextRequest) {
+    const requestOrigin = request.nextUrl.origin;
+
     // Plain URL replacements (HTML attributes, JS string literals)
     let result = body
+        .replaceAll(`${requestOrigin}/`, `${PROXY_PATH}/`)
+        .replaceAll(`${requestOrigin}`, PROXY_PATH)
         .replaceAll("https://dzm.burblesoft.com/", `${PROXY_PATH}/`)
         .replaceAll("http://dzm.burblesoft.com/", `${PROXY_PATH}/`)
         .replaceAll("//dzm.burblesoft.com/", `${PROXY_PATH}/`)
@@ -69,6 +74,8 @@ function rewriteBody(body: string) {
 
     // JSON-escaped URL replacements (e.g. "baseUrl":"https:\/\/dzm.burblesoft.com\/")
     result = result
+        .replaceAll(`${requestOrigin.replaceAll("/", "\\/")}\\/`, `${PROXY_PATH}\\/`)
+        .replaceAll(requestOrigin.replaceAll("/", "\\/"), PROXY_PATH)
         .replaceAll("https:\\/\\/dzm.burblesoft.com\\/", `${PROXY_PATH}\\/`)
         .replaceAll("http:\\/\\/dzm.burblesoft.com\\/", `${PROXY_PATH}\\/`)
         .replaceAll("https:\\/\\/dzm.burblesoft.com", PROXY_PATH)
@@ -78,12 +85,45 @@ function rewriteBody(body: string) {
 }
 
 function rewriteLocationHeader(location: string, request: NextRequest) {
+    const upstreamHost = new URL(UPSTREAM_ORIGIN).host;
+    const contextDzId =
+        request.nextUrl.searchParams.get("dz_id") ?? request.nextUrl.searchParams.get("__dzctx") ?? "";
+
+    const appendDzContextIfNeeded = (target: string) => {
+        if (!contextDzId || !target.startsWith(`${PROXY_PATH}/jumper_manifest_public`)) {
+            return target;
+        }
+
+        if (target.includes("dz_id=") || target.includes("__dzctx=")) {
+            return target;
+        }
+
+        const separator = target.includes("?") ? "&" : "?";
+        return `${target}${separator}__dzctx=${encodeURIComponent(contextDzId)}`;
+    };
+
+    try {
+        const parsed = new URL(location, request.nextUrl.origin);
+        const isUpstreamLocation = parsed.host === upstreamHost;
+        const isCurrentHostLocation = parsed.host === request.nextUrl.host;
+
+        if (isUpstreamLocation || isCurrentHostLocation) {
+            const rewrittenPath = parsed.pathname.startsWith(PROXY_PATH)
+                ? parsed.pathname
+                : `${PROXY_PATH}${parsed.pathname}`;
+
+            return appendDzContextIfNeeded(`${rewrittenPath}${parsed.search}${parsed.hash}`);
+        }
+    } catch {
+        // Fall back to string-based rewriting below.
+    }
+
     if (location.startsWith(UPSTREAM_ORIGIN)) {
-        return `${PROXY_PATH}${location.slice(UPSTREAM_ORIGIN.length)}`;
+        return appendDzContextIfNeeded(`${PROXY_PATH}${location.slice(UPSTREAM_ORIGIN.length)}`);
     }
 
     if (location.startsWith("/")) {
-        return `${PROXY_PATH}${location}`;
+        return appendDzContextIfNeeded(`${PROXY_PATH}${location}`);
     }
 
     return location;
@@ -97,17 +137,56 @@ async function handleRequest(
     const upstreamPath = `/${(path ?? []).join("/")}`;
     const upstreamUrl = new URL(`${UPSTREAM_ORIGIN}${upstreamPath}`);
     upstreamUrl.search = request.nextUrl.search;
+    upstreamUrl.searchParams.delete("__dzctx");
+
+    const isManifestRoot = upstreamPath === "/jumper_manifest_public";
+    const requestDzId = request.nextUrl.searchParams.get("dz_id");
+    const contextDzId = requestDzId ?? request.nextUrl.searchParams.get("__dzctx") ?? "";
+    const hasDzId = Boolean(requestDzId);
+    const existingDzId = request.cookies.get(ACTIVE_DZ_COOKIE)?.value ?? "";
+    const shouldResetSession = hasDzId && requestDzId !== existingDzId;
+
+    const hasDzContext = Boolean(contextDzId) || Boolean(existingDzId);
+
+    if (isManifestRoot && !hasDzContext) {
+        const missingDzResponse = new NextResponse("Missing required dz_id query parameter.", {
+            status: 400,
+            headers: {
+                "content-type": "text/plain; charset=utf-8",
+                "cache-control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+                pragma: "no-cache",
+                expires: "0",
+                "surrogate-control": "no-store",
+            },
+        });
+
+        request.cookies
+            .getAll()
+            .filter((cookie) => cookie.name.startsWith(COOKIE_PREFIX))
+            .forEach((cookie) => {
+                missingDzResponse.cookies.delete(cookie.name);
+            });
+
+        return missingDzResponse;
+    }
 
     const headers = new Headers();
     // If the URL contains dz_id, force a fresh Burble session so it correctly
-    // associates the session with that DZ. Otherwise reuse the existing session.
-    const hasDzId = upstreamUrl.searchParams.has("dz_id");
-    const incomingCookieHeader = hasDzId ? "" : buildUpstreamCookieHeader(request);
+    // associates the session with that DZ only when switching DZs.
+    const incomingCookieHeader = shouldResetSession ? "" : buildUpstreamCookieHeader(request);
 
     request.headers.forEach((value, key) => {
         const lowerKey = key.toLowerCase();
 
-        if (["host", "cookie", "content-length"].includes(lowerKey)) {
+        if ([
+            "host",
+            "cookie",
+            "content-length",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "forwarded",
+        ].includes(lowerKey)) {
             return;
         }
 
@@ -132,9 +211,14 @@ async function handleRequest(
     responseHeaders.delete("content-security-policy");
     responseHeaders.delete("content-security-policy-report-only");
     responseHeaders.delete("x-frame-options");
+    responseHeaders.delete("strict-transport-security");
     responseHeaders.delete("content-encoding");
     responseHeaders.delete("content-length");
     responseHeaders.delete("set-cookie");
+    responseHeaders.set("cache-control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    responseHeaders.set("pragma", "no-cache");
+    responseHeaders.set("expires", "0");
+    responseHeaders.set("surrogate-control", "no-store");
 
     const location = upstreamResponse.headers.get("location");
     if (location) {
@@ -149,7 +233,7 @@ async function handleRequest(
         contentType.includes("xml");
 
     const response = new NextResponse(
-        isTextResponse ? rewriteBody(await upstreamResponse.text()) : await upstreamResponse.arrayBuffer(),
+        isTextResponse ? rewriteBody(await upstreamResponse.text(), request) : await upstreamResponse.arrayBuffer(),
         {
             status: upstreamResponse.status,
             headers: responseHeaders,
@@ -161,6 +245,30 @@ async function handleRequest(
             ? upstreamResponse.headers.getSetCookie()
             : splitSetCookieHeader(upstreamResponse.headers.get("set-cookie") ?? "");
     const shouldUseSecureCookies = request.nextUrl.protocol === "https:";
+
+    // Only clear old proxy cookies when switching to a different DZ.
+    if (shouldResetSession) {
+        const existingCookies = request.cookies
+            .getAll()
+            .filter((cookie) => cookie.name.startsWith(COOKIE_PREFIX) && cookie.name !== ACTIVE_DZ_COOKIE);
+
+        if (existingCookies.length > 0) {
+            existingCookies.forEach((cookie) => {
+                response.cookies.delete(cookie.name);
+            });
+        }
+    }
+
+    if (hasDzId && requestDzId) {
+        response.cookies.set({
+            name: ACTIVE_DZ_COOKIE,
+            value: requestDzId,
+            path: "/",
+            httpOnly: false,
+            secure: false,
+            sameSite: "lax",
+        });
+    }
 
     setCookieValues
         .filter(Boolean)
